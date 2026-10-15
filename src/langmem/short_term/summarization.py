@@ -1,5 +1,6 @@
+import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, cast
 
 from langchain_core.language_models import LanguageModelLike
@@ -39,6 +40,7 @@ DEFAULT_EXISTING_SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
+
 DEFAULT_FINAL_SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
     [
         # if exists
@@ -64,6 +66,15 @@ class RunningSummary:
 
     last_summarized_message_id: str | None
     """The ID of the last message that was summarized."""
+
+    generated_message_ids: set[str] = field(default_factory=set)
+    """IDs of the summary message(s) this module injected on the previous step.
+
+    Used as state-authenticated provenance: on the next feedback call we recognize and
+    drop only the messages whose IDs we ourselves recorded here, never a caller's message.
+    Defaults to an empty set so summaries produced before this field existed (legacy
+    checkpoints) keep their previous behavior and are not guessed at or deleted.
+    """
 
 
 @dataclass
@@ -111,6 +122,15 @@ def _preprocess_messages(
     """Preprocess messages for summarization."""
     if max_summary_tokens >= max_tokens:
         raise ValueError("`max_summary_tokens` must be less than `max_tokens`.")
+
+    # Drop this module's own previously-injected summary message(s), identified only by
+    # the ids we ourselves recorded in running_summary.generated_message_ids. A message id
+    # is the standard LangChain message-identity key: once an id is recorded here, the
+    # message carrying it is treated as this module's prior injection. No fixed/probe id is
+    # assumed to be reserved or unused by callers.
+    generated_ids = running_summary.generated_message_ids if running_summary else set()
+    if generated_ids:
+        messages = [m for m in messages if m.id not in generated_ids]
 
     # Set max_tokens_before_summary to max_tokens if not provided
     if max_tokens_before_summary is None:
@@ -298,14 +318,11 @@ def _prepare_summarization_result(
         preprocessed_messages.messages_to_summarize
     )
     if running_summary:
-        # Only include system message if it doesn't overlap with the existing summary.
-        # This is useful if the messages passed to summarize_messages already include a system message with summary.
-        # This usually happens when summarization node overwrites the message history.
-        include_system_message = preprocessed_messages.existing_system_message and not (
-            existing_summary
-            and existing_summary.summary
-            in preprocessed_messages.existing_system_message.content
-        )
+        # The caller's system message (if any) is always preserved. Our own previously
+        # injected summary was already filtered out by state-authenticated id in
+        # _preprocess_messages, so existing_system_message here is always caller data --
+        # we never drop it based on whether its text contains the running summary.
+        include_system_message = preprocessed_messages.existing_system_message is not None
         updated_messages = cast(
             ChatPromptValue,
             final_prompt.invoke(
@@ -318,9 +335,30 @@ def _prepare_summarization_result(
                 }
             ),
         )
+        # Identify the message(s) this module just rendered (vs. the caller's own system
+        # and retained messages, carried through by object identity). Copy them, assign a
+        # fresh uuid, and record that id so the next feedback call recognizes its own
+        # injection structurally (regardless of the role the final_prompt rendered it as).
+        # We never mutate the caller-owned running_summary: build a new RunningSummary via
+        # dataclasses.replace (copying the id set), so a caller reusing the same object or
+        # sharing it across threads sees no in-place changes.
+        caller_object_ids = set()
+        if preprocessed_messages.existing_system_message is not None:
+            caller_object_ids.add(id(preprocessed_messages.existing_system_message))
+        for m in messages[total_summarized_messages:]:
+            caller_object_ids.add(id(m))
+        out_messages: list[AnyMessage] = []
+        new_generated_ids: set[str] = set()
+        for m in updated_messages.messages:
+            if id(m) not in caller_object_ids:
+                m = m.model_copy()
+                m.id = uuid.uuid4().hex
+                new_generated_ids.add(m.id)
+            out_messages.append(m)
+        new_running_summary = replace(running_summary, generated_message_ids=new_generated_ids)
         return SummarizationResult(
-            running_summary=running_summary,
-            messages=updated_messages.messages,
+            running_summary=new_running_summary,
+            messages=out_messages,
         )
     else:
         # no changes are needed
@@ -442,6 +480,11 @@ def summarize_messages(
         graph.invoke({"messages": "what's my name?"}, config)
         ```
     """
+    # Drop this module's own previously-injected summary message(s), recognized only by
+    # the ids recorded in running_summary.generated_message_ids (state-authenticated).
+    gen_ids = running_summary.generated_message_ids if running_summary else set()
+    if gen_ids:
+        messages = [m for m in messages if m.id not in gen_ids]
     preprocessed_messages = _preprocess_messages(
         messages=messages,
         running_summary=running_summary,
@@ -453,16 +496,10 @@ def summarize_messages(
     if preprocessed_messages.existing_system_message:
         messages = messages[1:]
 
-    if not messages:
-        return SummarizationResult(
-            running_summary=running_summary,
-            messages=(
-                messages
-                if preprocessed_messages.existing_system_message is None
-                else [preprocessed_messages.existing_system_message] + messages
-            ),
-        )
-
+    # No early return for an empty retained tail: when a running summary exists we still
+    # want the summary message emitted (Scenario E). Falling through to
+    # _prepare_summarization_result handles both the empty-tail case and the no-summary
+    # (running_summary is None) case identically to before.
     existing_summary = running_summary
     summarized_message_ids = (
         set(running_summary.summarized_message_ids) if running_summary else set()
@@ -523,6 +560,7 @@ async def asummarize_messages(
             - if a new summary needs to be generated, it is generated by incorporating the existing summary value from the running summary
         model: The language model to use for generating summaries.
         max_tokens: Maximum number of tokens to return in the final output. Will be enforced only after summarization.
+            This will also be used as the maximum number of tokens to feed to the summarization LLM.
         max_tokens_before_summary: Maximum number of tokens to accumulate before triggering summarization.
             Defaults to the same value as `max_tokens` if not provided.
             This allows fitting more tokens into the summarization LLM, if needed.
@@ -603,6 +641,11 @@ async def asummarize_messages(
         await graph.ainvoke({"messages": "what's my name?"}, config)
         ```
     """
+    # Drop this module's own previously-injected summary message(s), recognized only by
+    # the ids recorded in running_summary.generated_message_ids (state-authenticated).
+    gen_ids = running_summary.generated_message_ids if running_summary else set()
+    if gen_ids:
+        messages = [m for m in messages if m.id not in gen_ids]
     preprocessed_messages = _preprocess_messages(
         messages=messages,
         running_summary=running_summary,
@@ -614,16 +657,10 @@ async def asummarize_messages(
     if preprocessed_messages.existing_system_message:
         messages = messages[1:]
 
-    if not messages:
-        return SummarizationResult(
-            running_summary=running_summary,
-            messages=(
-                messages
-                if preprocessed_messages.existing_system_message is None
-                else [preprocessed_messages.existing_system_message] + messages
-            ),
-        )
-
+    # No early return for an empty retained tail: when a running summary exists we still
+    # want the summary message emitted (Scenario E). Falling through to
+    # _prepare_summarization_result handles both the empty-tail case and the no-summary
+    # (running_summary is None) case identically to before.
     existing_summary = running_summary
     summarized_message_ids = (
         set(running_summary.summarized_message_ids) if running_summary else set()
@@ -684,7 +721,7 @@ class SummarizationNode(RunnableCallable):
         Args:
             model: The language model to use for generating summaries.
             max_tokens: Maximum number of tokens to return in the final output. Will be enforced only after summarization.
-            max_tokens_before_summary: Maximum number of tokens to accumulate before triggering summarization.
+                max_tokens_before_summary: Maximum number of tokens to accumulate before triggering summarization.
                 Defaults to the same value as `max_tokens` if not provided.
                 This allows fitting more tokens into the summarization LLM, if needed.
 
@@ -767,7 +804,6 @@ class SummarizationNode(RunnableCallable):
 
             checkpointer = InMemorySaver()
             workflow = StateGraph(State)
-            workflow.add_node(call_model)
             workflow.add_node("summarize", summarization_node)
             workflow.add_edge(START, "summarize")
             workflow.add_edge("summarize", "call_model")
