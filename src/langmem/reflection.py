@@ -269,6 +269,7 @@ class LocalReflectionExecutor:
         )
         self._worker.start()
         self._store_lock = threading.Lock()
+        self._submit_lock = threading.Lock()
 
     def submit(
         self,
@@ -305,6 +306,20 @@ class LocalReflectionExecutor:
                             " Please initialize the store with ReflectionExecutor(my_memory_manager, store=your_base_store)."
                         ) from None
         thread_id = typing.cast(typing.Optional[str], thread_id)
+        # Admission check: reject immediately if shut down, before touching any
+        # existing pending task (so we never cancel a task as a side effect of
+        # a post-shutdown submit).
+        with self._submit_lock:
+            if not self._worker_running:
+                raise RuntimeError(
+                    "ReflectionExecutor has been shut down and cannot accept new tasks. "
+                    "Create a new ReflectionExecutor instance to submit more work."
+                )
+        # Cancel any existing pending task for this thread_id. Done outside the
+        # admission lock: future.cancel() may invoke user-registered done
+        # callbacks that re-enter submit()/shutdown(), and a non-reentrant lock
+        # would deadlock. Same-thread-id cancellation races are tracked
+        # separately (see PR #185).
         if thread_id in self._pending_tasks:
             existing = self._pending_tasks.get(thread_id)
             if existing:
@@ -323,9 +338,17 @@ class LocalReflectionExecutor:
             cancel_event=cancel_event,
             config=config,
         )
-        if thread_id:
-            self._pending_tasks[thread_id] = task
-        self._task_queue.put((time.time() + after_seconds, task))
+        with self._submit_lock:
+            # Re-check after releasing the lock: shutdown() may have flipped
+            # the flag while we were cancelling the old task.
+            if not self._worker_running:
+                raise RuntimeError(
+                    "ReflectionExecutor has been shut down and cannot accept new tasks. "
+                    "Create a new ReflectionExecutor instance to submit more work."
+                )
+            if thread_id:
+                self._pending_tasks[thread_id] = task
+            self._task_queue.put((time.time() + after_seconds, task))
         return future
 
     def search(
@@ -367,7 +390,8 @@ class LocalReflectionExecutor:
         return typing.cast(list[MemoryItem], [it.dict() for it in results])
 
     def shutdown(self, wait=True, *, cancel_futures=False):
-        self._worker_running = False
+        with self._submit_lock:
+            self._worker_running = False
         if cancel_futures:
             for task in list(self._pending_tasks.values()):
                 task.cancel_event.set()
